@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: video-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: MAX_PARALLEL_JOBS
+        value: "2"
