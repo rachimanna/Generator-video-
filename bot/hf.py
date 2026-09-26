@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gradio_client import Client, handle_file
+from gradio_client.exceptions import AppError
 
 from .config import config
 
@@ -116,23 +117,44 @@ def _score(name: str, info: dict, job: Job) -> float | None:
     return score
 
 
-def _pick_endpoint(client: Client, job: Job, api_name: str | None) -> tuple[str, list[dict]]:
+def _callable_names(client: Client) -> set[str] | None:
+    """Эндпоинты, которые реально можно вызвать (view_api иногда показывает лишние)."""
+    try:
+        deps = client.config.get("dependencies", [])
+    except Exception:  # noqa: BLE001
+        return None
+    names = set()
+    for d in deps:
+        name = d.get("api_name")
+        if not name or d.get("api_visibility") == "private" or d.get("show_api") is False:
+            continue
+        names.add("/" + name)
+    return names
+
+
+def _pick_endpoints(client: Client, job: Job, api_name: str | None) -> list[tuple[str, list[dict]]]:
+    """Возвращает подходящие эндпоинты, лучший первым."""
     api = client.view_api(print_info=False, return_format="dict") or {}
     endpoints: dict = api.get("named_endpoints", {})
+    callable_names = _callable_names(client)
+    if callable_names:
+        hidden = [n for n in endpoints if n not in callable_names]
+        if hidden:
+            log.info("Пропускаю невызываемые эндпоинты: %s", hidden)
+        endpoints = {n: i for n, i in endpoints.items() if n in callable_names}
     if not endpoints:
         raise SpaceError("у спейса нет публичного API")
     if api_name:
         if api_name not in endpoints:
             raise SpaceError(f"эндпоинт {api_name} не найден, есть: {', '.join(endpoints)}")
-        return api_name, endpoints[api_name].get("parameters", [])
+        return [(api_name, endpoints[api_name].get("parameters", []))]
 
     scored = [(s, n) for n, i in endpoints.items() if (s := _score(n, i, job)) is not None]
     if not scored:
         raise SpaceError(f"не нашёл подходящий эндпоинт среди: {', '.join(endpoints)}")
     scored.sort(reverse=True)
-    name = scored[0][1]
-    log.info("Выбран эндпоинт %s (кандидаты: %s)", name, scored[:4])
-    return name, endpoints[name].get("parameters", [])
+    log.info("Кандидаты: %s", scored[:4])
+    return [(n, endpoints[n].get("parameters", [])) for _, n in scored[:3]]
 
 
 def _file_arg(path: str, p: dict) -> Any:
@@ -222,11 +244,21 @@ def _pick_output(result: Any, want: str) -> str:
 def _run_space(spec: str, job: Job) -> str:
     space, _, api_name = spec.partition("@")
     client = _client(space)
-    endpoint, params = _pick_endpoint(client, job, api_name or None)
-    kwargs = _build_kwargs(params, job)
-    log.info("%s%s ← %s", space, endpoint, list(kwargs))
-    result = client.predict(api_name=endpoint, **kwargs)
-    return _pick_output(result, job.want)
+    errors = []
+    for endpoint, params in _pick_endpoints(client, job, api_name or None):
+        kwargs = _build_kwargs(params, job)
+        log.info("%s%s ← %s", space, endpoint, list(kwargs))
+        try:
+            result = client.predict(api_name=endpoint, **kwargs)
+        except AppError:
+            raise  # сама модель упала (квота, ошибка внутри) — перебор эндпоинтов не поможет
+        except (ValueError, TypeError) as exc:
+            # эндпоинт не принял вызов (не тот API / не те параметры) — пробуем следующий
+            log.warning("%s%s: %s", space, endpoint, exc)
+            errors.append(f"{endpoint}: {exc}")
+            continue
+        return _pick_output(result, job.want)
+    raise SpaceError("; ".join(errors))
 
 
 async def run(spaces: list[str], job: Job) -> str:
