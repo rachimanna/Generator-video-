@@ -31,12 +31,12 @@ class Config:
     )
 
     fade_seconds: float = float(os.getenv("FADE_SECONDS", "0.6"))
-    job_timeout: int = int(os.getenv("JOB_TIMEOUT", "300"))  # сек. на одну модель
+    job_timeout: int = int(os.getenv("JOB_TIMEOUT", "600"))  # сек. на одну модель
     auto_discover: bool = os.getenv("AUTO_DISCOVER", "1") not in ("0", "false", "no")
     max_model_tries: int = int(os.getenv("MAX_MODEL_TRIES", "4"))
-    max_video_seconds: float = float(os.getenv("MAX_VIDEO_SECONDS", "6"))  # длиннее — обрежем
-    max_video_side: int = int(os.getenv("MAX_VIDEO_SIDE", "540"))
-    video_fps: int = int(os.getenv("VIDEO_FPS", "15"))
+    max_video_seconds: float = float(os.getenv("MAX_VIDEO_SECONDS", "10"))  # длиннее — обрежем
+    max_video_side: int = int(os.getenv("MAX_VIDEO_SIDE", "720"))
+    video_fps: int = int(os.getenv("VIDEO_FPS", "24"))
     max_parallel_jobs: int = int(os.getenv("MAX_PARALLEL_JOBS", "2"))
 
     webhook_base_url: str = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
