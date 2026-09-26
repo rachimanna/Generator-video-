@@ -43,12 +43,24 @@ async def animate_photo(photo: str, prompt: str | None) -> str:
     return await polish_video(await hf.run(config.img2video_spaces, job))
 
 
+def _say(text: str) -> None:
+    live = hf.current_status.get()
+    if live:
+        live.text = text
+
+
 async def swap_face_video(face: str, video: str) -> str:
+    _say(f"Готовлю видео (до {config.max_video_seconds:g} с, {config.max_video_side}p)")
+    video = await to_mp4(video)
+    _say("Ищу лицо на фото")
+    face = await crop_face(face)
     job = hf.Job(face_image=face, target_video=video, want="video", hints=("swap", "video", "predict", "run", "process"))
     return await polish_video(await hf.run(config.faceswap_video_spaces, job))
 
 
 async def swap_face_image(face: str, target: str) -> str:
+    _say("Ищу лицо на фото")
+    face = await crop_face(face)
     job = hf.Job(face_image=face, target_image=target, want="image", hints=("swap", "predict", "run", "process"))
     return await hf.run(config.faceswap_image_spaces, job)
 
@@ -113,7 +125,46 @@ async def to_mp4(path: str) -> str:
         "-i", path, "-t", str(config.max_video_seconds),
         "-vf", f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease,"
                "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=25",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", out,
     )
     return out if ok else path
+
+
+def _crop_face_sync(path: str) -> str:
+    try:
+        import cv2
+    except ImportError:
+        return path
+    img = cv2.imread(path)
+    if img is None:
+        return path
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
+    if len(faces) <= 1 and max(img.shape[:2]) <= 1600:
+        return path  # одно лицо — фото и так подходит
+    if len(faces) == 0:
+        return path
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])  # самое крупное анфас
+    h_img, w_img = img.shape[:2]
+    pad = int(max(w, h) * 0.8)  # берём с запасом: волосы, подбородок, шея
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w_img, x + w + pad), min(h_img, y + h + pad)
+    out = new_path(".jpg")
+    cv2.imwrite(out, img[y0:y1, x0:x1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+    log.info("Лиц на фото: %d, вырезал самое крупное %s", len(faces), (x0, y0, x1, y1))
+    return out
+
+
+async def crop_face(path: str) -> str:
+    """Если на фото коллаж/несколько лиц — оставляем одно, самое крупное анфас.
+
+    Модели замены лица берут первое найденное лицо, и на коллаже это может быть
+    профиль или мелкий кадр — тогда результат получается плохим.
+    """
+    try:
+        return await asyncio.to_thread(_crop_face_sync, path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("crop_face: %s", exc)
+        return path

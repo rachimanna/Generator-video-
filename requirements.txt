@@ -1,3 +1,4 @@
 aiogram>=3.13,<4
 gradio_client>=1.4
 python-dotenv>=1.0
+opencv-python-headless>=4.8,<5

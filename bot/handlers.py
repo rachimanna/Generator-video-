@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -160,8 +161,6 @@ async def download(bot: Bot, message: Message) -> tuple[str, str]:
         raise ValueError("неподдерживаемый тип файла")
     path = services.new_path(ext)
     await bot.download(file_id, destination=path)
-    if kind == "video":
-        path = await services.to_mp4(path)
     return kind, path
 
 
@@ -188,12 +187,15 @@ async def album_part(message: Message, bot: Bot) -> None:
         return
     await asyncio.sleep(1.5)  # ждём остальные части альбома
     parts = sorted(_groups.pop(group_id, []), key=lambda m: m.message_id)
+    ack = await message.answer("📥 Получил альбом, скачиваю файлы…")
 
     files = [f for m in parts if (f := await safe_download(bot, m))]
     photos = [p for k, p in files if k == "photo"]
     videos = [p for k, p in files if k == "video"]
     caption = next((m.caption for m in parts if m.caption), None)
     sess = session(message.from_user.id)
+    with contextlib.suppress(Exception):
+        await ack.delete()
 
     if photos and videos:
         sess.face = photos[0]
