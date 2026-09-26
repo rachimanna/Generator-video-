@@ -100,9 +100,20 @@ async def polish_video(path: str) -> str:
 
 
 async def to_mp4(path: str) -> str:
-    """Приводим входящее видео (кружочки, gif, webm) к mp4 для моделей."""
-    if not shutil.which("ffmpeg") or path.lower().endswith(".mp4"):
+    """Готовим входящее видео для модели: mp4, не длиннее MAX_VIDEO_SECONDS, не больше MAX_VIDEO_SIDE.
+
+    Замена лица идёт покадрово, поэтому длинное/тяжёлое видео на бесплатной модели
+    может считаться десятки минут — режем заранее.
+    """
+    if not shutil.which("ffmpeg"):
         return path
+    side = config.max_video_side
     out = new_path(".mp4")
-    ok = await _ffmpeg("-i", path, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", out)
+    ok = await _ffmpeg(
+        "-i", path, "-t", str(config.max_video_seconds),
+        "-vf", f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease,"
+               "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=25",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", out,
+    )
     return out if ok else path

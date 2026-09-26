@@ -9,9 +9,11 @@ Spaces часто меняют названия эндпоинтов и пара
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +33,46 @@ TARGET_WORDS = ("target", "dest", "dst", "video", "original", "base")
 
 class SpaceError(RuntimeError):
     pass
+
+
+@dataclass
+class LiveStatus:
+    """Реальный статус задачи на спейсе — его показывает прогресс-бар в чате."""
+
+    text: str | None = None
+    progress: float | None = None  # 0..1, если модель сообщает прогресс
+    eta: float | None = None
+
+
+current_status: contextvars.ContextVar[LiveStatus | None] = contextvars.ContextVar("current_status", default=None)
+
+
+def _update_status(space: str, st: Any, live: LiveStatus | None) -> None:
+    if live is None or st is None:
+        return
+    code = getattr(getattr(st, "code", None), "value", "")
+    model = space.split("/")[-1]
+    live.eta = getattr(st, "eta", None)
+    if code in ("STARTING", "JOINING_QUEUE"):
+        live.text = f"Подключаюсь к модели {model}"
+    elif code == "IN_QUEUE":
+        rank, size = getattr(st, "rank", None), getattr(st, "queue_size", None)
+        live.text = f"Очередь на {model}: " + (f"{rank + 1} из {size}" if rank is not None and size else "ждём")
+    elif code == "QUEUE_FULL":
+        live.text = f"Очередь {model} переполнена"
+    elif code == "SENDING_DATA":
+        live.text = f"Отправляю файлы в {model}"
+    elif code in ("PROCESSING", "ITERATING", "PROGRESS"):
+        live.text = f"{model} обрабатывает"
+        units = getattr(st, "progress_data", None) or []
+        if units:
+            u = units[-1]
+            if u.progress is not None:
+                live.progress = float(u.progress)
+            elif u.index is not None and u.length:
+                live.progress = u.index / u.length
+            if u.desc:
+                live.text = f"{model}: {u.desc}"
 
 
 @dataclass
@@ -249,7 +291,7 @@ def _run_space(spec: str, job: Job) -> str:
         kwargs = _build_kwargs(params, job)
         log.info("%s%s ← %s", space, endpoint, list(kwargs))
         try:
-            result = client.predict(api_name=endpoint, **kwargs)
+            result = _submit_and_wait(client, space, endpoint, kwargs)
         except AppError:
             raise  # сама модель упала (квота, ошибка внутри) — перебор эндпоинтов не поможет
         except (ValueError, TypeError) as exc:
@@ -261,10 +303,29 @@ def _run_space(spec: str, job: Job) -> str:
     raise SpaceError("; ".join(errors))
 
 
+def _submit_and_wait(client: Client, space: str, endpoint: str, kwargs: dict) -> Any:
+    live = current_status.get()
+    job = client.submit(api_name=endpoint, **kwargs)
+    deadline = time.monotonic() + config.job_timeout
+    while not job.done():
+        if time.monotonic() > deadline:
+            job.cancel()
+            raise SpaceError(f"модель не ответила за {config.job_timeout} с (JOB_TIMEOUT)")
+        try:
+            _update_status(space, job.status(), live)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+    return job.result()
+
+
 async def run(spaces: list[str], job: Job) -> str:
     """Пробует спейсы по очереди, возвращает путь к готовому файлу."""
     errors = []
+    live = current_status.get()
     for spec in spaces:
+        if live:
+            live.text, live.progress, live.eta = f"Подключаюсь к {spec.split('@')[0]}", None, None
         try:
             return await asyncio.to_thread(_run_space, spec, job)
         except Exception as exc:  # noqa: BLE001 — любой сбой спейса = пробуем следующий

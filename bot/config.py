@@ -31,6 +31,9 @@ class Config:
     )
 
     fade_seconds: float = float(os.getenv("FADE_SECONDS", "0.6"))
+    job_timeout: int = int(os.getenv("JOB_TIMEOUT", "600"))  # сек. на одну модель
+    max_video_seconds: float = float(os.getenv("MAX_VIDEO_SECONDS", "10"))  # длиннее — обрежем
+    max_video_side: int = int(os.getenv("MAX_VIDEO_SIDE", "720"))
     max_parallel_jobs: int = int(os.getenv("MAX_PARALLEL_JOBS", "2"))
 
     webhook_base_url: str = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
