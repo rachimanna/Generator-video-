@@ -38,7 +38,7 @@ async def health(_: web.Request) -> web.Response:
 
 
 def run_webhook(bot: Bot, dp: Dispatcher) -> None:
-    async def on_startup(_: Bot) -> None:
+    async def on_startup() -> None:
         await bot.set_webhook(
             config.webhook_base_url + WEBHOOK_PATH,
             secret_token=config.webhook_secret or None,
