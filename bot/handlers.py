@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import os
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from aiogram.types import (
     Message,
 )
 
-from . import services
+from . import hf, services
 from .config import config
 from .ui import Progress
 
@@ -52,7 +53,7 @@ START_TEXT = (
     "🎭 <b>Замена лица в видео</b> — пришли фото с лицом и видео "
     "(одним альбомом или по очереди, порядок не важен).\n"
     "🖼 <b>Замена лица на фото</b> — альбом из двух фото: сначала лицо, потом куда его поставить.\n\n"
-    "Команды: /video &lt;описание&gt;, /face — сбросить лицо, /cancel — очистить всё.\n\n"
+    "Команды: /video &lt;описание&gt;, /face — сбросить лицо, /models — какие модели сейчас живы, /cancel — очистить всё.\n\n"
     "⚠️ Используй только свои лица или лица людей, которые дали согласие. "
     "Не выдавай результат за реальную запись."
 )
@@ -68,6 +69,26 @@ async def start(message: Message) -> None:
 async def cancel(message: Message) -> None:
     _sessions.pop(message.from_user.id, None)
     await message.answer("🧹 Всё очищено. Можно начинать заново.")
+
+
+@router.message(Command("models"))
+async def models_cmd(message: Message) -> None:
+    """Показывает, какие модели бот сейчас видит и в каком они состоянии."""
+    await message.answer("🔎 Смотрю, какие модели сейчас живы…")
+    groups = [
+        ("🎭 Замена лица в видео", config.faceswap_video_spaces, hf.Job(target_video="x", search=("video face swap", "face swap video"))),
+        ("🖼 Замена лица на фото", config.faceswap_image_spaces, hf.Job(search=("face swap",))),
+        ("✍️ Текст → видео", config.text2video_spaces, hf.Job(search=("text to video",))),
+        ("✨ Оживление фото", config.img2video_spaces, hf.Job(search=("image to video",))),
+    ]
+    lines = []
+    for title, spaces, job in groups:
+        cands = await asyncio.to_thread(hf.candidates, spaces, job)
+        lines.append(f"<b>{title}</b>")
+        lines += [f"{n}. {html.escape(c.label())}" for n, c in enumerate(cands, 1)] or ["— ничего не найдено"]
+        lines.append("")
+    lines.append("Бот пробует их по порядку: сначала работающие на GPU.")
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("face"))

@@ -85,6 +85,7 @@ class Job:
     target_image: str | None = None    # фото, на котором меняем лицо / кадр для анимации
     target_video: str | None = None    # видео, в котором меняем лицо
     want: str = "video"                # "video" | "image"
+    search: tuple[str, ...] = field(default_factory=tuple)  # запросы для автопоиска моделей на HF
     hints: tuple[str, ...] = field(default_factory=tuple)  # слова, по которым выбираем эндпоинт
 
     @property
@@ -319,18 +320,122 @@ def _submit_and_wait(client: Client, space: str, endpoint: str, kwargs: dict) ->
     return job.result()
 
 
+# ---------- автопоиск живых моделей на Hugging Face ----------
+
+BAD_STAGES = {"PAUSED", "STOPPED", "RUNTIME_ERROR", "BUILD_ERROR", "CONFIG_ERROR", "NO_APP_FILE", "DELETING"}
+_HF_API = "https://huggingface.co/api/spaces"
+_discover_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+@dataclass
+class SpaceInfo:
+    id: str
+    stage: str = "UNKNOWN"
+    hardware: str = ""
+    likes: int = 0
+    configured: bool = False
+    api_name: str = ""
+
+    @property
+    def gpu(self) -> bool:
+        return bool(self.hardware) and not self.hardware.startswith("cpu")
+
+    @property
+    def spec(self) -> str:
+        return f"{self.id}@{self.api_name}" if self.api_name else self.id
+
+    def label(self) -> str:
+        hw = self.hardware or "?"
+        return f"{self.id} [{self.stage.lower()}, {hw}, ♥{self.likes}]"
+
+
+def _parse_space(d: dict) -> SpaceInfo:
+    rt = d.get("runtime") or {}
+    hw = rt.get("hardware") or {}
+    return SpaceInfo(
+        id=d.get("id", ""),
+        stage=rt.get("stage") or "UNKNOWN",
+        hardware=(hw.get("current") or hw.get("requested") or "") if isinstance(hw, dict) else str(hw),
+        likes=int(d.get("likes") or 0),
+    )
+
+
+def _hf_get(url: str, params: list[tuple[str, str]]) -> Any:
+    import httpx
+
+    headers = {"Authorization": f"Bearer {config.hf_token}"} if config.hf_token else {}
+    r = httpx.get(url, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+_EXPAND = [("expand[]", "runtime"), ("expand[]", "likes"), ("expand[]", "sdk")]
+
+
+def space_info(space_id: str) -> SpaceInfo:
+    try:
+        return _parse_space(_hf_get(f"{_HF_API}/{space_id}", _EXPAND))
+    except Exception as exc:  # noqa: BLE001
+        log.info("Нет информации о %s: %s", space_id, exc)
+        return SpaceInfo(id=space_id)
+
+
+def discover(query: str, limit: int = 30) -> list[SpaceInfo]:
+    now = time.monotonic()
+    cached = _discover_cache.get(query)
+    if cached and now - cached[0] < 1800:
+        raw = cached[1]
+    else:
+        try:
+            raw = _hf_get(_HF_API, [("search", query), ("sort", "likes"), ("direction", "-1"), ("limit", str(limit)), *_EXPAND])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Автопоиск '%s' не удался: %s", query, exc)
+            return []
+        _discover_cache[query] = (now, raw)
+    return [_parse_space(d) for d in raw if d.get("sdk") in (None, "gradio")]
+
+
+def candidates(spaces: list[str], job: Job) -> list[SpaceInfo]:
+    """Настроенные модели + найденные автопоиском, живые и на GPU — первыми."""
+    found: dict[str, SpaceInfo] = {}
+    for spec in spaces:
+        sid, _, api = spec.partition("@")
+        info = space_info(sid)
+        info.configured, info.api_name = True, api
+        found[sid] = info
+    if config.auto_discover:
+        for q in job.search:
+            for info in discover(q):
+                if job.target_video and "vid" not in info.id.lower():
+                    continue  # для видео нужны именно видео-модели
+                found.setdefault(info.id, info)
+    alive = [i for i in found.values() if i.stage not in BAD_STAGES]
+    skipped = [i.label() for i in found.values() if i.stage in BAD_STAGES and i.configured]
+    if skipped:
+        log.info("Выключенные модели пропускаю: %s", skipped)
+    running = {"RUNNING": 0, "RUNNING_BUILDING": 0, "APP_STARTING": 1, "SLEEPING": 2, "BUILDING": 3}
+    alive.sort(key=lambda i: (not i.gpu, running.get(i.stage, 2), not i.configured, -i.likes))
+    return alive[: config.max_model_tries]
+
+
 async def run(spaces: list[str], job: Job) -> str:
-    """Пробует спейсы по очереди, возвращает путь к готовому файлу."""
+    """Пробует модели по очереди, возвращает путь к готовому файлу."""
     errors = []
     live = current_status.get()
-    for spec in spaces:
+    if live:
+        live.text = "Ищу свободную модель"
+    cands = await asyncio.to_thread(candidates, spaces, job)
+    if not cands:
+        cands = [SpaceInfo(id=s.partition("@")[0], api_name=s.partition("@")[2]) for s in spaces]
+    log.info("Порядок моделей: %s", [c.label() for c in cands])
+    for n, info in enumerate(cands, 1):
         if live:
-            live.text, live.progress, live.eta = f"Подключаюсь к {spec.split('@')[0]}", None, None
+            live.text, live.progress, live.eta = f"Модель {n}/{len(cands)}: {info.id}", None, None
         try:
-            return await asyncio.to_thread(_run_space, spec, job)
+            return await asyncio.to_thread(_run_space, info.spec, job)
         except Exception as exc:  # noqa: BLE001 — любой сбой спейса = пробуем следующий
-            log.warning("Спейс %s не сработал: %s", spec, exc)
+            log.warning("Спейс %s не сработал: %s", info.spec, exc)
             with _clients_lock:
-                _clients.pop(spec.partition("@")[0], None)
-            errors.append(f"• {spec}: {str(exc)[:200]}")
+                _clients.pop(info.id, None)
+            errors.append(f"• {info.id}: {str(exc)[:160]}")
     raise SpaceError("Все модели сейчас недоступны:\n" + "\n".join(errors))

@@ -28,6 +28,7 @@ async def text_to_video(prompt: str) -> str:
         negative_prompt=NEGATIVE,
         want="video",
         hints=("text_to_video", "t2v", "text", "generate", "infer"),
+        search=("text to video",),
     )
     return await polish_video(await hf.run(config.text2video_spaces, job))
 
@@ -39,6 +40,7 @@ async def animate_photo(photo: str, prompt: str | None) -> str:
         target_image=photo,
         want="video",
         hints=("image_to_video", "i2v", "image", "animate", "generate"),
+        search=("image to video",),
     )
     return await polish_video(await hf.run(config.img2video_spaces, job))
 
@@ -54,14 +56,16 @@ async def swap_face_video(face: str, video: str) -> str:
     video = await to_mp4(video)
     _say("Ищу лицо на фото")
     face = await crop_face(face)
-    job = hf.Job(face_image=face, target_video=video, want="video", hints=("swap", "video", "predict", "run", "process"))
+    job = hf.Job(face_image=face, target_video=video, want="video", hints=("swap", "video", "predict", "run", "process"),
+                 search=("video face swap", "face swap video"))
     return await polish_video(await hf.run(config.faceswap_video_spaces, job))
 
 
 async def swap_face_image(face: str, target: str) -> str:
     _say("Ищу лицо на фото")
     face = await crop_face(face)
-    job = hf.Job(face_image=face, target_image=target, want="image", hints=("swap", "predict", "run", "process"))
+    job = hf.Job(face_image=face, target_image=target, want="image", hints=("swap", "predict", "run", "process"),
+                 search=("face swap",))
     return await hf.run(config.faceswap_image_spaces, job)
 
 
@@ -124,7 +128,7 @@ async def to_mp4(path: str) -> str:
     ok = await _ffmpeg(
         "-i", path, "-t", str(config.max_video_seconds),
         "-vf", f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease,"
-               "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=25",
+               f"scale=trunc(iw/2)*2:trunc(ih/2)*2,fps={config.video_fps}",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", out,
     )
