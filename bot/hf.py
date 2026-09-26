@@ -42,6 +42,7 @@ class LiveStatus:
     text: str | None = None
     progress: float | None = None  # 0..1, если модель сообщает прогресс
     eta: float | None = None
+    queued: bool = False
 
 
 current_status: contextvars.ContextVar[LiveStatus | None] = contextvars.ContextVar("current_status", default=None)
@@ -53,6 +54,7 @@ def _update_status(space: str, st: Any, live: LiveStatus | None) -> None:
     code = getattr(getattr(st, "code", None), "value", "")
     model = space.split("/")[-1]
     live.eta = getattr(st, "eta", None)
+    live.queued = code in ("STARTING", "JOINING_QUEUE", "IN_QUEUE", "QUEUE_FULL")
     if code in ("STARTING", "JOINING_QUEUE"):
         live.text = f"Подключаюсь к модели {model}"
     elif code == "IN_QUEUE":
@@ -284,7 +286,7 @@ def _pick_output(result: Any, want: str) -> str:
     raise SpaceError(f"модель не вернула файл (ответ: {str(result)[:200]})")
 
 
-def _run_space(spec: str, job: Job) -> str:
+def _run_space(spec: str, job: Job, deadline: float) -> str:
     space, _, api_name = spec.partition("@")
     client = _client(space)
     errors = []
@@ -292,7 +294,7 @@ def _run_space(spec: str, job: Job) -> str:
         kwargs = _build_kwargs(params, job)
         log.info("%s%s ← %s", space, endpoint, list(kwargs))
         try:
-            result = _submit_and_wait(client, space, endpoint, kwargs)
+            result = _submit_and_wait(client, space, endpoint, kwargs, deadline)
         except AppError:
             raise  # сама модель упала (квота, ошибка внутри) — перебор эндпоинтов не поможет
         except (ValueError, TypeError) as exc:
@@ -304,19 +306,44 @@ def _run_space(spec: str, job: Job) -> str:
     raise SpaceError("; ".join(errors))
 
 
-def _submit_and_wait(client: Client, space: str, endpoint: str, kwargs: dict) -> Any:
+def _submit_and_wait(client: Client, space: str, endpoint: str, kwargs: dict, deadline: float) -> Any:
+    """Ждём результат, но не сидим вечно в чужой очереди.
+
+    - общий лимит на модель: JOB_TIMEOUT (и не дольше общего дедлайна задачи);
+    - если модель сама говорит, что ждать дольше, чем осталось времени — уходим сразу;
+    - если стоим в очереди дольше QUEUE_PATIENCE — уходим к следующей модели.
+    """
     live = current_status.get()
     job = client.submit(api_name=endpoint, **kwargs)
-    deadline = time.monotonic() + config.job_timeout
-    while not job.done():
-        if time.monotonic() > deadline:
-            job.cancel()
-            raise SpaceError(f"модель не ответила за {config.job_timeout} с (JOB_TIMEOUT)")
-        try:
-            _update_status(space, job.status(), live)
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(2)
+    start = time.monotonic()
+    deadline = min(deadline, start + config.job_timeout)
+    queued_since: float | None = None
+    try:
+        while not job.done():
+            now = time.monotonic()
+            if now > deadline:
+                raise SpaceError(f"не успела за {int(now - start)} с")
+            try:
+                st = job.status()
+                _update_status(space, st, live)
+            except Exception:  # noqa: BLE001
+                st = None
+            code = getattr(getattr(st, "code", None), "value", "")
+            if code in ("IN_QUEUE", "QUEUE_FULL", "JOINING_QUEUE"):
+                queued_since = queued_since or now
+                eta = getattr(st, "eta", None)
+                if code == "QUEUE_FULL":
+                    raise SpaceError("очередь переполнена")
+                if eta and now + eta > deadline:
+                    raise SpaceError(f"очередь ~{int(eta // 60)} мин — слишком долго")
+                if now - queued_since > config.queue_patience:
+                    raise SpaceError(f"простояли в очереди {int(now - queued_since)} с")
+            elif code:
+                queued_since = None
+            time.sleep(2)
+    except SpaceError:
+        job.cancel()
+        raise
     return job.result()
 
 
@@ -428,11 +455,16 @@ async def run(spaces: list[str], job: Job) -> str:
     if not cands:
         cands = [SpaceInfo(id=s.partition("@")[0], api_name=s.partition("@")[2]) for s in spaces]
     log.info("Порядок моделей: %s", [c.label() for c in cands])
+    deadline = time.monotonic() + config.total_timeout
     for n, info in enumerate(cands, 1):
+        if time.monotonic() > deadline - 30:
+            errors.append(f"• общий лимит {config.total_timeout // 60} мин исчерпан")
+            break
         if live:
-            live.text, live.progress, live.eta = f"Модель {n}/{len(cands)}: {info.id}", None, None
+            hw = "GPU" if info.gpu else (info.hardware or "?")
+            live.text, live.progress, live.eta = f"Модель {n}/{len(cands)}: {info.id} ({hw})", None, None
         try:
-            return await asyncio.to_thread(_run_space, info.spec, job)
+            return await asyncio.to_thread(_run_space, info.spec, job, deadline)
         except Exception as exc:  # noqa: BLE001 — любой сбой спейса = пробуем следующий
             log.warning("Спейс %s не сработал: %s", info.spec, exc)
             with _clients_lock:

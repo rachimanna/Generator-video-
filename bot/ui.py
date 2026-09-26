@@ -40,7 +40,9 @@ class Progress:
     def _render(self, tick: int) -> str:
         elapsed = time.monotonic() - self._start
         live = self.live
-        if live.progress is not None:
+        if live.queued:
+            ratio = 0.05  # в очереди — честно не двигаемся
+        elif live.progress is not None:
             ratio = max(0.0, min(live.progress, 1.0))  # настоящий прогресс от модели
         else:
             # модель прогресс не сообщает — плавно ползём, но не упираемся в «почти готово»
@@ -48,7 +50,7 @@ class Progress:
         filled = int(ratio * BAR)
         bar = "▰" * filled + "▱" * (BAR - filled)
         stage = html.escape(live.text) if live.text else STAGES[min(int(ratio * len(STAGES)), len(STAGES) - 1)]
-        eta = f" · осталось ~{int(live.eta)} с" if live.eta else ""
+        eta = f" · модель обещает ~{_fmt(live.eta)}" if live.eta else ""
         return (
             f"{FRAMES[tick % len(FRAMES)]} <b>{self.title}</b>\n\n"
             f"{bar} {int(ratio * 100)}%\n"

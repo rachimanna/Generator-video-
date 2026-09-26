@@ -32,6 +32,8 @@ class Config:
 
     fade_seconds: float = float(os.getenv("FADE_SECONDS", "0.6"))
     job_timeout: int = int(os.getenv("JOB_TIMEOUT", "600"))  # сек. на одну модель
+    total_timeout: int = int(os.getenv("TOTAL_TIMEOUT", "1500"))  # сек. на всю задачу
+    queue_patience: int = int(os.getenv("QUEUE_PATIENCE", "180"))  # сек. стоять в чужой очереди
     auto_discover: bool = os.getenv("AUTO_DISCOVER", "1") not in ("0", "false", "no")
     max_model_tries: int = int(os.getenv("MAX_MODEL_TRIES", "4"))
     max_video_seconds: float = float(os.getenv("MAX_VIDEO_SECONDS", "10"))  # длиннее — обрежем
